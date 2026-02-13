@@ -43,7 +43,7 @@ class SD2ToFlacApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SD2 → FLAC Converter")
-        self.minsize(640, 520)
+        self.minsize(640, 560)
         self._build_ui()
         self._running = False
 
@@ -119,6 +119,12 @@ class SD2ToFlacApp(tk.Tk):
         self.verbose_var = tk.BooleanVar(value=False)
         tk.Checkbutton(self, text="Verbose logging",
                        variable=self.verbose_var).grid(
+            row=row, column=0, columnspan=2, sticky=tk.W, **pad)
+
+        row += 1
+        self.include_input_dirname_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(self, text="Include input directory name in output folder",
+                       variable=self.include_input_dirname_var).grid(
             row=row, column=0, columnspan=2, sticky=tk.W, **pad)
 
         # ── Start button ────────────────────────────────────────────
@@ -207,6 +213,7 @@ class SD2ToFlacApp(tk.Tk):
         xattr = self.xattr_var.get()
         dry_run = self.dry_run_var.get()
         verbose = self.verbose_var.get()
+        include_input_dirname = self.include_input_dirname_var.get()
 
         self._running = True
         self.start_btn.configure(state=tk.DISABLED, text="Running…")
@@ -222,6 +229,7 @@ class SD2ToFlacApp(tk.Tk):
                 probe_bytes=probe_bytes,
                 dry_run=dry_run,
                 verbose=verbose,
+                include_input_dirname=include_input_dirname,
             ),
             daemon=True,
         )

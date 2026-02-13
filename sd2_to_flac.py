@@ -554,6 +554,7 @@ def main(
     probe_bytes=PROBE_BYTES,
     dry_run=False,
     verbose=False,
+    include_input_dirname=False,
 ):
     """
     Convert split-stereo .sd2 files to FLAC.
@@ -581,6 +582,13 @@ def main(
         Print ffmpeg commands without running them.
     verbose : bool
         Enable debug-level logging.
+    include_input_dirname : bool
+        When *output_dir* is set, include the basename of *input_dir* as
+        an extra directory level under *output_dir*.  For example, if
+        *input_dir* is ``/data/audio1`` and *output_dir* is ``/out``, a
+        file at ``day1/rec.L.sd2`` would be written to
+        ``/out/audio1/day1/rec.flac`` instead of ``/out/day1/rec.flac``.
+        Ignored when *output_dir* is ``None``.
 
     Returns
     -------
@@ -685,7 +693,10 @@ def main(
         # ── Determine output path ────────────────────────────────────
         if output_dir is not None:
             # Mirror the subdirectory structure under output_dir
-            dest_dir = output_dir / rel_dir
+            if include_input_dirname:
+                dest_dir = output_dir / input_dir.name / rel_dir
+            else:
+                dest_dir = output_dir / rel_dir
         else:
             # No output dir given — write next to the originals
             any_file = left if left is not None else right
@@ -721,6 +732,7 @@ examples:
   %(prog)s ./raw_audio --encoding 24be 16be
   %(prog)s ./raw_audio --xattr
   %(prog)s ./raw_audio --dry-run --verbose
+  %(prog)s ./raw_audio ./out --include-input-dirname
 """,
     )
     parser.add_argument(
@@ -751,6 +763,11 @@ examples:
     parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="Show debug output including per-candidate scores")
+    parser.add_argument(
+        "--include-input-dirname", action="store_true",
+        help="Include the input directory's basename as an extra level "
+             "in the output directory structure.  Only effective when "
+             "an output directory is specified.")
 
     args = parser.parse_args()
 
@@ -768,6 +785,7 @@ examples:
         probe_bytes=args.probe_bytes,
         dry_run=args.dry_run,
         verbose=args.verbose,
+        include_input_dirname=args.include_input_dirname,
     )
     if fail:
         sys.exit(1)
