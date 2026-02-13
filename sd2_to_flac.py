@@ -2,9 +2,9 @@
 """
 sd2_to_flac.py — Convert Sound Designer II (.sd2) split-stereo files to FLAC.
 
-Scans a directory for matching .L.sd2 / .R.sd2 pairs, guesses the PCM
-encoding (bit depth + endianness) by analysing sample statistics, then
-shells out to ffmpeg to merge and encode as FLAC.
+Scans a directory (recursively) for matching .L.sd2 / .R.sd2 pairs, guesses
+the PCM encoding (bit depth + endianness) by analysing sample statistics,
+then shells out to ffmpeg to merge and encode as FLAC.
 
 On macOS / HFS+ volumes the original SD2 resource fork may still be
 attached.  Use --xattr to attempt to read sample rate, bit depth, and
@@ -443,13 +443,20 @@ def try_xattr_metadata(filepath):
 
 def find_pairs(input_dir):
     """
-    Find .L.sd2 / .R.sd2 pairs and solo mono .sd2 files.
-    Returns {base_name: {"L": path, "R": path}} with either key optional.
+    Recursively find .L.sd2 / .R.sd2 pairs (and solo mono .sd2 files).
+
+    Returns a dict keyed by ``(relative_dir, base_name)`` where
+    *relative_dir* is a :class:`Path` relative to *input_dir* (or ``"."``
+    for the root) and *base_name* is the stem without the ``.L`` / ``.R``
+    suffix.  Values are dicts ``{"L": path, "R": path}`` with either key
+    optional.
     """
     sd2_lr = re.compile(r"^(.+)\.(L|R)(\.sd2)?$", re.IGNORECASE)
     pairs = {}
 
-    for entry in sorted(input_dir.iterdir()):
+    input_dir = Path(input_dir)
+
+    for entry in sorted(input_dir.rglob("*")):
         if not entry.is_file():
             continue
         m = sd2_lr.match(entry.name)
@@ -457,8 +464,14 @@ def find_pairs(input_dir):
             continue
         base = m.group(1)
         channel = m.group(2).upper()
-        pairs.setdefault(base, {})
-        pairs[base][channel] = entry
+        # Compute the directory path relative to input_dir
+        try:
+            rel_dir = entry.parent.relative_to(input_dir)
+        except ValueError:
+            rel_dir = Path(".")
+        key = (rel_dir, base)
+        pairs.setdefault(key, {})
+        pairs[key][channel] = entry
 
     return pairs
 
@@ -548,9 +561,11 @@ def main(
     Parameters
     ----------
     input_dir : str or Path
-        Directory containing .L.sd2 / .R.sd2 files.
+        Directory containing .L.sd2 / .R.sd2 files (searched recursively).
     output_dir : str, Path, or None
-        Output directory.  Defaults to *input_dir*.
+        Output directory.  The subdirectory structure under *input_dir* is
+        mirrored here.  If ``None``, FLAC files are written next to the
+        original .sd2 files.
     sample_rate : int or None
         Sample rate in Hz.  Overrides xattr-detected rate.
         Defaults to 44100 if not detected.
@@ -588,35 +603,32 @@ def main(
         log.error("Input directory does not exist: %s", input_dir)
         return (0, 0)
 
-    if output_dir is None:
-        output_dir = input_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     # Resolve candidate list
     if encoding:
         candidate_list = [ALL_CANDIDATES[k] for k in encoding]
     else:
         candidate_list = [ALL_CANDIDATES[k] for k in DEFAULT_CANDIDATES]
 
-    # Discover file pairs
+    # Discover file pairs (recursively)
     pairs = find_pairs(input_dir)
     if not pairs:
         log.error("No .L.sd2 / .R.sd2 files found in %s", input_dir)
         return (0, 0)
 
-    log.info("Found %d file pair(s) in %s", len(pairs), input_dir)
+    log.info("Found %d file pair(s) in %s (recursive)", len(pairs), input_dir)
     log.info("Candidate encodings: %s\n",
              ", ".join(c["label"] for c in candidate_list))
 
     ok_count = 0
     fail_count = 0
 
-    for base_name, channels in sorted(pairs.items()):
+    for (rel_dir, base_name), channels in sorted(pairs.items()):
         left = channels.get("L")
         right = channels.get("R")
         ch_desc = "stereo" if (left and right) else "mono"
 
-        log.info("── %s (%s) ──", base_name, ch_desc)
+        display_name = str(rel_dir / base_name) if str(rel_dir) != "." else base_name
+        log.info("── %s (%s) ──", display_name, ch_desc)
 
         if left and right:
             ls, rs = left.stat().st_size, right.stat().st_size
@@ -670,9 +682,19 @@ def main(
             sr = 44100
         log.info("  Sample rate: %d Hz", sr)
 
-        # ── Convert ──────────────────────────────────────────────────
-        out_path = output_dir / (base_name + ".flac")
+        # ── Determine output path ────────────────────────────────────
+        if output_dir is not None:
+            # Mirror the subdirectory structure under output_dir
+            dest_dir = output_dir / rel_dir
+        else:
+            # No output dir given — write next to the originals
+            any_file = left if left is not None else right
+            dest_dir = any_file.parent
 
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out_path = dest_dir / (base_name + ".flac")
+
+        # ── Convert ──────────────────────────────────────────────────
         if convert_pair(left, right, out_path, enc, sr, dry_run=dry_run):
             action = "Would create" if dry_run else "Created"
             log.info("  %s: %s\n", action, out_path)
@@ -703,10 +725,10 @@ examples:
     )
     parser.add_argument(
         "input_dir", type=Path,
-        help="Directory containing .L.sd2 / .R.sd2 files")
+        help="Directory containing .L.sd2 / .R.sd2 files (searched recursively)")
     parser.add_argument(
         "output_dir", type=Path, nargs="?", default=None,
-        help="Output directory (default: same as input_dir)")
+        help="Output directory (default: write next to originals)")
     parser.add_argument(
         "-r", "--sample-rate", type=int, default=None,
         help="Sample rate in Hz.  Overrides xattr-detected rate.  "
