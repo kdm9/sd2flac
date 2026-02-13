@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sd2-to-flac"
+version = "0.1.0"
+description = "Convert Sound Designer II (.sd2) split-stereo files to FLAC"
+readme = "README.md"
+requires-python = ">=3.7"
+license = {text = "MIT"}
+dependencies = [
+    "static-ffmpeg",
+]
+
+[project.optional-dependencies]
+app = [
+    "py2app",
+]
+
+[project.scripts]
+sd2-to-flac = "sd2_to_flac:cli"
+
+[project.gui-scripts]
+sd2-to-flac-gui = "sd2_to_flac_gui:gui"
+
+[tool.setuptools]
+py-modules = ["sd2_to_flac", "sd2_to_flac_gui"]

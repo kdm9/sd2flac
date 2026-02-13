@@ -1,0 +1,63 @@
+name: Build macOS App
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install py2app static-ffmpeg
+          python -m pip install -e .
+
+      - name: Download static ffmpeg binary
+        run: |
+          python -c "import static_ffmpeg; static_ffmpeg.add_paths(); print('ffmpeg ready')"
+
+      - name: Build .app with py2app
+        run: |
+          python setup_app.py py2app
+
+      - name: Verify .app exists
+        run: |
+          ls -la dist/
+          test -d "dist/SD2 to FLAC.app" || test -d dist/*.app
+
+      - name: Create ZIP archive
+        run: |
+          cd dist
+          zip -r -y "../SD2-to-FLAC.zip" *.app
+          cd ..
+          ls -la SD2-to-FLAC.zip
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SD2-to-FLAC-macOS
+          path: SD2-to-FLAC.zip
+          if-no-files-found: error
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SD2-to-FLAC.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
