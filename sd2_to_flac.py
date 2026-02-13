@@ -446,7 +446,7 @@ def find_pairs(input_dir):
     Find .L.sd2 / .R.sd2 pairs and solo mono .sd2 files.
     Returns {base_name: {"L": path, "R": path}} with either key optional.
     """
-    sd2_lr = re.compile(r"^(.+)\.(L|R)\.sd2$", re.IGNORECASE)
+    sd2_lr = re.compile(r"^(.+)\.(L|R)(\.sd2)?$", re.IGNORECASE)
     pairs = {}
 
     for entry in sorted(input_dir.iterdir()):
