@@ -2,8 +2,9 @@
 """
 sd2_to_flac_gui.py — Tkinter GUI for sd2_to_flac.
 
-Provides directory choosers, option widgets, a Start button, and a
-scrolling log text box that captures all logger output in real time.
+Converts SD2, AIFF, and WAV audio files to FLAC.  Provides directory
+choosers, option widgets, a Start button, and a scrolling log text box
+that captures all logger output in real time.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ class TextHandler(logging.Handler):
 class SD2ToFlacApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("SD2 → FLAC Converter")
+        self.title("Audio → FLAC Converter")
         self.minsize(640, 560)
         self._build_ui()
         self._running = False
@@ -72,42 +73,43 @@ class SD2ToFlacApp(tk.Tk):
         tk.Button(self, text="Browse…", command=self._browse_output).grid(
             row=row, column=2, **pad)
 
-        # ── Sample rate ──────────────────────────────────────────────
+        # ── SD2 options (separator) ──────────────────────────────────
         row += 1
-        tk.Label(self, text="Sample rate (Hz):").grid(
-            row=row, column=0, sticky=tk.W, **pad)
-        self.sr_var = tk.StringVar(value="")
-        sr_entry = tk.Entry(self, textvariable=self.sr_var, width=12)
-        sr_entry.grid(row=row, column=1, sticky=tk.W, **pad)
-        tk.Label(self, text="(leave blank for auto / 44100)").grid(
-            row=row, column=2, sticky=tk.W, **pad)
+        sd2_frame = tk.LabelFrame(self, text="SD2 options (raw PCM files only)",
+                                  padx=6, pady=4)
+        sd2_frame.grid(row=row, column=0, columnspan=3, sticky=tk.EW, **pad)
 
-        # ── Encoding ────────────────────────────────────────────────
-        row += 1
-        tk.Label(self, text="Encoding:").grid(
-            row=row, column=0, sticky=tk.W, **pad)
+        # Sample rate
+        tk.Label(sd2_frame, text="Sample rate (Hz):").grid(
+            row=0, column=0, sticky=tk.W, padx=4, pady=2)
+        self.sr_var = tk.StringVar(value="")
+        tk.Entry(sd2_frame, textvariable=self.sr_var, width=12).grid(
+            row=0, column=1, sticky=tk.W, padx=4, pady=2)
+        tk.Label(sd2_frame, text="(leave blank for auto / 44100)").grid(
+            row=0, column=2, sticky=tk.W, padx=4, pady=2)
+
+        # Encoding
+        tk.Label(sd2_frame, text="Encoding:").grid(
+            row=1, column=0, sticky=tk.W, padx=4, pady=2)
         encoding_choices = ["Auto (try all)"] + list(ALL_CANDIDATES.keys())
         self.encoding_var = tk.StringVar(value=encoding_choices[0])
-        enc_combo = ttk.Combobox(
-            self, textvariable=self.encoding_var,
+        ttk.Combobox(
+            sd2_frame, textvariable=self.encoding_var,
             values=encoding_choices, state="readonly", width=20,
-        )
-        enc_combo.grid(row=row, column=1, sticky=tk.W, **pad)
+        ).grid(row=1, column=1, sticky=tk.W, padx=4, pady=2)
 
-        # ── Probe bytes ─────────────────────────────────────────────
-        row += 1
-        tk.Label(self, text="Probe bytes:").grid(
-            row=row, column=0, sticky=tk.W, **pad)
+        # Probe bytes
+        tk.Label(sd2_frame, text="Probe bytes:").grid(
+            row=2, column=0, sticky=tk.W, padx=4, pady=2)
         self.probe_var = tk.StringVar(value=str(PROBE_BYTES))
-        tk.Entry(self, textvariable=self.probe_var, width=12).grid(
-            row=row, column=1, sticky=tk.W, **pad)
+        tk.Entry(sd2_frame, textvariable=self.probe_var, width=12).grid(
+            row=2, column=1, sticky=tk.W, padx=4, pady=2)
 
-        # ── Checkboxes ──────────────────────────────────────────────
-        row += 1
+        # xattr checkbox (inside SD2 frame)
         self.xattr_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(self, text="Read xattr / resource fork metadata",
+        tk.Checkbutton(sd2_frame, text="Read xattr / resource fork metadata",
                        variable=self.xattr_var).grid(
-            row=row, column=0, columnspan=2, sticky=tk.W, **pad)
+            row=3, column=0, columnspan=3, sticky=tk.W, padx=4, pady=2)
 
         row += 1
         self.dry_run_var = tk.BooleanVar(value=False)
@@ -237,8 +239,10 @@ class SD2ToFlacApp(tk.Tk):
 
     def _run_conversion(self, **kwargs):
         try:
-            ok, fail = sd2_main(**kwargs)
-            summary = f"\n{'='*40}\nFinished: {ok} succeeded, {fail} failed.\n"
+            ok, fail, copied = sd2_main(**kwargs)
+            summary = (f"\n{'='*40}\n"
+                       f"Finished: {ok} converted, {fail} failed, "
+                       f"{copied} copied.\n")
             self.log_text.after(0, self._log_msg, summary)
         except Exception as exc:
             self.log_text.after(0, self._log_msg,

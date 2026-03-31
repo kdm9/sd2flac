@@ -27,6 +27,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -48,6 +49,11 @@ DEFAULT_CANDIDATES = ["16be", "16le", "24be", "24le", "32be", "32le"]
 
 # Bytes to read from each file for analysis
 PROBE_BYTES = 65536
+
+# Audio file extensions
+HEADERED_EXTENSIONS = {".aif", ".aiff", ".wav"}
+SD2_EXTENSIONS = {".sd2"}
+ALL_AUDIO_EXTENSIONS = HEADERED_EXTENSIONS | SD2_EXTENSIONS
 
 log = logging.getLogger("sd2_to_flac")
 log.setLevel(logging.DEBUG)
@@ -441,39 +447,88 @@ def try_xattr_metadata(filepath):
 
 # ── File discovery ───────────────────────────────────────────────────────────
 
-def find_pairs(input_dir):
-    """
-    Recursively find .L.sd2 / .R.sd2 pairs (and solo mono .sd2 files).
+def _audio_ext(name):
+    """Return the lowercase audio extension if the file is a known audio type."""
+    for ext in ALL_AUDIO_EXTENSIONS:
+        if name.lower().endswith(ext):
+            return ext
+    return None
 
-    Returns a dict keyed by ``(relative_dir, base_name)`` where
-    *relative_dir* is a :class:`Path` relative to *input_dir* (or ``"."``
-    for the root) and *base_name* is the stem without the ``.L`` / ``.R``
-    suffix.  Values are dicts ``{"L": path, "R": path}`` with either key
-    optional.
+
+def find_audio_files(input_dir):
     """
-    sd2_lr = re.compile(r"^(.+)\.(L|R)(\.sd2)?$", re.IGNORECASE)
-    pairs = {}
+    Recursively discover audio files under *input_dir*.
+
+    Returns a tuple of:
+      sd2_pairs      — {(rel_dir, base): {"L": path, "R": path}}
+      headered_pairs — {(rel_dir, base): {"L": path, "R": path}}
+      headered_solo  — [(rel_dir, path), ...]
+      other_files    — [(rel_dir, path), ...]
+
+    L/R detection:  <name>.L.ext / <name>.R.ext  or  <name>.L / <name>.R
+    """
+    ext_pattern = "|".join(re.escape(e) for e in ALL_AUDIO_EXTENSIONS)
+    lr_re = re.compile(
+        r"^(.+)\.(L|R)(" + ext_pattern + r")?$", re.IGNORECASE
+    )
 
     input_dir = Path(input_dir)
 
-    for entry in sorted(input_dir.rglob("*")):
-        if not entry.is_file():
-            continue
-        m = sd2_lr.match(entry.name)
+    sd2_pairs = {}
+    headered_pairs = {}
+    headered_solo = []
+    other_files = []
+    claimed = set()  # full paths already assigned
+
+    all_files = sorted(e for e in input_dir.rglob("*") if e.is_file())
+
+    # First pass: find L/R pairs
+    for entry in all_files:
+        m = lr_re.match(entry.name)
         if not m:
             continue
         base = m.group(1)
         channel = m.group(2).upper()
-        # Compute the directory path relative to input_dir
+        ext_part = (m.group(3) or "").lower()
+
         try:
             rel_dir = entry.parent.relative_to(input_dir)
         except ValueError:
             rel_dir = Path(".")
         key = (rel_dir, base)
-        pairs.setdefault(key, {})
-        pairs[key][channel] = entry
 
-    return pairs
+        if ext_part in SD2_EXTENSIONS or ext_part == "":
+            sd2_pairs.setdefault(key, {})
+            sd2_pairs[key][channel] = entry
+        elif ext_part in HEADERED_EXTENSIONS:
+            headered_pairs.setdefault(key, {})
+            headered_pairs[key][channel] = entry
+        claimed.add(entry)
+
+    # Second pass: single (non-paired) headered audio files
+    for entry in all_files:
+        if entry in claimed:
+            continue
+        ext = _audio_ext(entry.name)
+        if ext and ext in HEADERED_EXTENSIONS:
+            try:
+                rel_dir = entry.parent.relative_to(input_dir)
+            except ValueError:
+                rel_dir = Path(".")
+            headered_solo.append((rel_dir, entry))
+            claimed.add(entry)
+
+    # Everything else
+    for entry in all_files:
+        if entry in claimed:
+            continue
+        try:
+            rel_dir = entry.parent.relative_to(input_dir)
+        except ValueError:
+            rel_dir = Path(".")
+        other_files.append((rel_dir, entry))
+
+    return sd2_pairs, headered_pairs, headered_solo, other_files
 
 
 # ── ffmpeg conversion ────────────────────────────────────────────────────────
@@ -532,6 +587,91 @@ def convert_pair(left, right, output, encoding, sample_rate, dry_run=False):
         return False
 
 
+# ── Headered audio conversion (AIFF / WAV) ──────────────────────────────────
+
+def convert_headered_pair(left, right, output, dry_run=False):
+    """
+    Merge two mono AIFF/WAV files (L + R) into a stereo FLAC.
+    ffmpeg reads the headers directly — no encoding guessing needed.
+    """
+    channels = [p for p in (left, right) if p is not None]
+    if not channels:
+        return False
+
+    cmd = ["ffmpeg", "-y"]
+    for ch_path in channels:
+        cmd.extend(["-i", str(ch_path)])
+
+    if len(channels) == 2:
+        cmd.extend([
+            "-filter_complex", "[0:a][1:a]amerge=inputs=2[aout]",
+            "-map", "[aout]",
+        ])
+
+    cmd.extend(["-c:a", "flac", "-compression_level", "12", str(output)])
+
+    log.info("  cmd: %s", " ".join(cmd))
+    if dry_run:
+        return True
+
+    try:
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        if result.returncode != 0:
+            log.error("ffmpeg failed for %s:\n%s", output.name,
+                      result.stderr.decode("utf-8", errors="replace"))
+            return False
+        return True
+    except FileNotFoundError:
+        log.error("ffmpeg not found on PATH.")
+        return False
+
+
+def convert_headered_single(src, output, dry_run=False):
+    """Convert a single AIFF/WAV file to FLAC."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(src),
+        "-c:a", "flac", "-compression_level", "12",
+        str(output),
+    ]
+
+    log.info("  cmd: %s", " ".join(cmd))
+    if dry_run:
+        return True
+
+    try:
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        if result.returncode != 0:
+            log.error("ffmpeg failed for %s:\n%s", output.name,
+                      result.stderr.decode("utf-8", errors="replace"))
+            return False
+        return True
+    except FileNotFoundError:
+        log.error("ffmpeg not found on PATH.")
+        return False
+
+
+# ── Verbatim copy ───────────────────────────────────────────────────────────
+
+def copy_file(src, dst, dry_run=False):
+    """Copy a file verbatim, creating parent directories as needed."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dry_run:
+        log.info("  Would copy: %s → %s", src, dst)
+        return True
+    try:
+        shutil.copy2(src, dst)
+        log.info("  Copied: %s → %s", src, dst)
+        return True
+    except OSError as exc:
+        log.error("  Failed to copy %s: %s", src, exc)
+        return False
+
+
 # ── Main (library entry point) ───────────────────────────────────────────────
 
 def _ensure_ffmpeg():
@@ -557,43 +697,40 @@ def main(
     include_input_dirname=False,
 ):
     """
-    Convert split-stereo .sd2 files to FLAC.
+    Convert audio files (.sd2, .aiff, .aif, .wav) to FLAC.
 
     Parameters
     ----------
     input_dir : str or Path
-        Directory containing .L.sd2 / .R.sd2 files (searched recursively).
+        Directory containing audio files (searched recursively).
     output_dir : str, Path, or None
         Output directory.  The subdirectory structure under *input_dir* is
         mirrored here.  If ``None``, FLAC files are written next to the
-        original .sd2 files.
+        originals.
     sample_rate : int or None
         Sample rate in Hz.  Overrides xattr-detected rate.
-        Defaults to 44100 if not detected.
+        Defaults to 44100 if not detected.  Only used for SD2 files.
     encoding : list of str, or None
-        Candidate encoding key(s) from ALL_CANDIDATES.
+        Candidate encoding key(s) from ALL_CANDIDATES (SD2 only).
         If one value is given it is used directly; if multiple are given
         the best is auto-selected.  ``None`` means try all.
     xattr : bool
-        Attempt to read metadata from extended attributes / resource fork.
+        Attempt to read metadata from extended attributes / resource fork
+        (SD2 only).
     probe_bytes : int
-        Bytes to read per file for encoding detection.
+        Bytes to read per file for encoding detection (SD2 only).
     dry_run : bool
         Print ffmpeg commands without running them.
     verbose : bool
         Enable debug-level logging.
     include_input_dirname : bool
         When *output_dir* is set, include the basename of *input_dir* as
-        an extra directory level under *output_dir*.  For example, if
-        *input_dir* is ``/data/audio1`` and *output_dir* is ``/out``, a
-        file at ``day1/rec.L.sd2`` would be written to
-        ``/out/audio1/day1/rec.flac`` instead of ``/out/day1/rec.flac``.
-        Ignored when *output_dir* is ``None``.
+        an extra directory level under *output_dir*.
 
     Returns
     -------
-    tuple of (int, int)
-        (ok_count, fail_count)
+    tuple of (int, int, int)
+        (ok_count, fail_count, copy_count)
     """
     input_dir = Path(input_dir)
     if output_dir is not None:
@@ -609,7 +746,7 @@ def main(
 
     if not input_dir.is_dir():
         log.error("Input directory does not exist: %s", input_dir)
-        return (0, 0)
+        return (0, 0, 0)
 
     # Resolve candidate list
     if encoding:
@@ -617,26 +754,51 @@ def main(
     else:
         candidate_list = [ALL_CANDIDATES[k] for k in DEFAULT_CANDIDATES]
 
-    # Discover file pairs (recursively)
-    pairs = find_pairs(input_dir)
-    if not pairs:
-        log.error("No .L.sd2 / .R.sd2 files found in %s", input_dir)
-        return (0, 0)
+    # Discover all audio files (recursively)
+    sd2_pairs, headered_pairs, headered_solo, other_files = find_audio_files(input_dir)
 
-    log.info("Found %d file pair(s) in %s (recursive)", len(pairs), input_dir)
-    log.info("Candidate encodings: %s\n",
-             ", ".join(c["label"] for c in candidate_list))
+    total_items = len(sd2_pairs) + len(headered_pairs) + len(headered_solo)
+    if total_items == 0 and not other_files:
+        log.error("No audio files found in %s", input_dir)
+        return (0, 0, 0)
+
+    log.info("Found %d SD2 pair(s), %d AIFF/WAV pair(s), %d single AIFF/WAV, "
+             "%d other file(s) in %s",
+             len(sd2_pairs), len(headered_pairs), len(headered_solo),
+             len(other_files), input_dir)
+    if sd2_pairs:
+        log.info("SD2 candidate encodings: %s",
+                 ", ".join(c["label"] for c in candidate_list))
+    log.info("")
 
     ok_count = 0
     fail_count = 0
+    copy_count = 0
 
-    for (rel_dir, base_name), channels in sorted(pairs.items()):
+    def _dest_dir(rel_dir):
+        if output_dir is not None:
+            if include_input_dirname:
+                return output_dir / input_dir.name / rel_dir
+            else:
+                return output_dir / rel_dir
+        return None
+
+    def _copy_verbatim(src, rel_dir):
+        nonlocal copy_count
+        dd = _dest_dir(rel_dir)
+        if dd is None:
+            dd = src.parent
+        copy_file(src, dd / src.name, dry_run=dry_run)
+        copy_count += 1
+
+    # ── SD2 pairs (raw PCM — needs encoding guess) ──────────────────────
+    for (rel_dir, base_name), channels in sorted(sd2_pairs.items()):
         left = channels.get("L")
         right = channels.get("R")
         ch_desc = "stereo" if (left and right) else "mono"
 
         display_name = str(rel_dir / base_name) if str(rel_dir) != "." else base_name
-        log.info("── %s (%s) ──", display_name, ch_desc)
+        log.info("── [SD2] %s (%s) ──", display_name, ch_desc)
 
         if left and right:
             ls, rs = left.stat().st_size, right.stat().st_size
@@ -644,7 +806,7 @@ def main(
                 log.warning("  Warning: L/R sizes differ (L=%d, R=%d bytes)",
                             ls, rs)
 
-        # ── xattr metadata ───────────────────────────────────────────
+        # xattr metadata
         xattr_info = {}
         if xattr:
             for fp in [left, right]:
@@ -655,7 +817,7 @@ def main(
                         for k, v in xi.items():
                             xattr_info.setdefault(k, v)
 
-        # ── Determine encoding ───────────────────────────────────────
+        # Determine encoding
         if len(candidate_list) == 1:
             enc = candidate_list[0]
             log.info("  Encoding (specified): %s", enc["label"])
@@ -675,12 +837,14 @@ def main(
                      len(probe_files))
             enc = guess_encoding(probe_files, active_candidates, probe_bytes)
             if enc is None:
-                log.error("  Could not determine encoding — skipping.")
-                fail_count += 1
+                log.error("  Could not determine encoding — copying verbatim.")
+                for fp in [left, right]:
+                    if fp is not None:
+                        _copy_verbatim(fp, rel_dir)
                 continue
             log.info("  Detected: %s", enc["label"])
 
-        # ── Determine sample rate ────────────────────────────────────
+        # Determine sample rate
         if sample_rate:
             sr = sample_rate
         elif "sample_rate" in xattr_info:
@@ -690,32 +854,89 @@ def main(
             sr = 44100
         log.info("  Sample rate: %d Hz", sr)
 
-        # ── Determine output path ────────────────────────────────────
-        if output_dir is not None:
-            # Mirror the subdirectory structure under output_dir
-            if include_input_dirname:
-                dest_dir = output_dir / input_dir.name / rel_dir
-            else:
-                dest_dir = output_dir / rel_dir
-        else:
-            # No output dir given — write next to the originals
+        # Determine output path
+        dd = _dest_dir(rel_dir)
+        if dd is None:
             any_file = left if left is not None else right
-            dest_dir = any_file.parent
+            dd = any_file.parent
+        dd.mkdir(parents=True, exist_ok=True)
+        out_path = dd / (base_name + ".flac")
 
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        out_path = dest_dir / (base_name + ".flac")
-
-        # ── Convert ──────────────────────────────────────────────────
-        if convert_pair(left, right, out_path, enc, sr, dry_run=dry_run):
-            action = "Would create" if dry_run else "Created"
-            log.info("  %s: %s\n", action, out_path)
-            ok_count += 1
-        else:
-            log.error("  Failed: %s\n", out_path)
+        # Convert
+        try:
+            if convert_pair(left, right, out_path, enc, sr, dry_run=dry_run):
+                action = "Would create" if dry_run else "Created"
+                log.info("  %s: %s\n", action, out_path)
+                ok_count += 1
+            else:
+                raise RuntimeError("ffmpeg conversion failed")
+        except Exception as exc:
+            log.error("  Error converting %s: %s — copying verbatim", base_name, exc)
+            for fp in [left, right]:
+                if fp is not None:
+                    _copy_verbatim(fp, rel_dir)
             fail_count += 1
 
-    log.info("Done. %d succeeded, %d failed.", ok_count, fail_count)
-    return (ok_count, fail_count)
+    # ── Headered L/R pairs (AIFF / WAV) ─────────────────────────────────
+    for (rel_dir, base_name), channels in sorted(headered_pairs.items()):
+        left = channels.get("L")
+        right = channels.get("R")
+        ch_desc = "stereo" if (left and right) else "mono"
+
+        display_name = str(rel_dir / base_name) if str(rel_dir) != "." else base_name
+        log.info("── [AIFF/WAV pair] %s (%s) ──", display_name, ch_desc)
+
+        dd = _dest_dir(rel_dir)
+        if dd is None:
+            any_file = left if left is not None else right
+            dd = any_file.parent
+        dd.mkdir(parents=True, exist_ok=True)
+        out_path = dd / (base_name + ".flac")
+
+        try:
+            if convert_headered_pair(left, right, out_path, dry_run=dry_run):
+                action = "Would create" if dry_run else "Created"
+                log.info("  %s: %s\n", action, out_path)
+                ok_count += 1
+            else:
+                raise RuntimeError("ffmpeg conversion failed")
+        except Exception as exc:
+            log.error("  Error converting %s: %s — copying verbatim", base_name, exc)
+            for fp in [left, right]:
+                if fp is not None:
+                    _copy_verbatim(fp, rel_dir)
+            fail_count += 1
+
+    # ── Single headered files (AIFF / WAV) ──────────────────────────────
+    for rel_dir, src in headered_solo:
+        stem = src.stem
+        log.info("── [AIFF/WAV] %s ──", src.name)
+
+        dd = _dest_dir(rel_dir)
+        if dd is None:
+            dd = src.parent
+        dd.mkdir(parents=True, exist_ok=True)
+        out_path = dd / (stem + ".flac")
+
+        try:
+            if convert_headered_single(src, out_path, dry_run=dry_run):
+                action = "Would create" if dry_run else "Created"
+                log.info("  %s: %s\n", action, out_path)
+                ok_count += 1
+            else:
+                raise RuntimeError("ffmpeg conversion failed")
+        except Exception as exc:
+            log.error("  Error converting %s: %s — copying verbatim", src.name, exc)
+            _copy_verbatim(src, rel_dir)
+            fail_count += 1
+
+    # ── Other files — copy verbatim ─────────────────────────────────────
+    for rel_dir, src in other_files:
+        _copy_verbatim(src, rel_dir)
+
+    log.info("Done. %d converted, %d failed, %d copied.",
+             ok_count, fail_count, copy_count)
+    return (ok_count, fail_count, copy_count)
 
 
 # ── CLI entry point ──────────────────────────────────────────────────────────
@@ -723,7 +944,7 @@ def main(
 def cli():
     """Command-line interface — parses sys.argv and calls main()."""
     parser = argparse.ArgumentParser(
-        description="Convert split-stereo .sd2 files to FLAC via ffmpeg.",
+        description="Convert audio files (.sd2, .aiff, .wav) to FLAC.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
@@ -737,22 +958,23 @@ examples:
     )
     parser.add_argument(
         "input_dir", type=Path,
-        help="Directory containing .L.sd2 / .R.sd2 files (searched recursively)")
+        help="Directory containing audio files (searched recursively)")
     parser.add_argument(
         "output_dir", type=Path, nargs="?", default=None,
         help="Output directory (default: write next to originals)")
     parser.add_argument(
         "-r", "--sample-rate", type=int, default=None,
         help="Sample rate in Hz.  Overrides xattr-detected rate.  "
-             "Default 44100 if not detected.")
+             "Default 44100 if not detected.  SD2 only.")
     parser.add_argument(
         "--encoding", nargs="+", default=None, metavar="ENC",
         choices=list(ALL_CANDIDATES.keys()),
-        help="Candidate encoding(s) to try.  Choices: %(choices)s.  Default: all.")
+        help="Candidate encoding(s) to try (SD2 only).  "
+             "Choices: %(choices)s.  Default: all.")
     parser.add_argument(
         "--xattr", action="store_true",
         help="Attempt to read sample rate and bit depth from the file's "
-             "extended attributes / resource fork (macOS / HFS+).")
+             "extended attributes / resource fork (macOS / HFS+, SD2 only).")
     parser.add_argument(
         "--probe-bytes", type=int, default=PROBE_BYTES,
         help="Bytes to read per file for encoding detection "
@@ -776,7 +998,7 @@ examples:
         format="%(message)s",
     )
 
-    _ok, fail = main(
+    _ok, fail, _copied = main(
         input_dir=args.input_dir,
         output_dir=args.output_dir,
         sample_rate=args.sample_rate,
