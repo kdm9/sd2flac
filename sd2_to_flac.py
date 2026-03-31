@@ -587,6 +587,56 @@ def convert_pair(left, right, output, encoding, sample_rate, dry_run=False):
         return False
 
 
+# ── Format compatibility check ──────────────────────────────────────────────
+
+# FLAC supports signed integer PCM at 8, 16, 24, or 32 bits per sample.
+# Anything else (float, double, compressed codecs) would be lossily
+# converted by ffmpeg, which we must avoid for archival purposes.
+FLAC_COMPATIBLE_CODECS = {
+    "pcm_s8", "pcm_u8",
+    "pcm_s16be", "pcm_s16le",
+    "pcm_s24be", "pcm_s24le",
+    "pcm_s32be", "pcm_s32le",
+}
+
+
+def probe_audio_codec(filepath):
+    """
+    Use ffprobe to determine the audio codec of a file.
+    Returns the codec name string (e.g. 'pcm_s24be', 'pcm_f32le') or None.
+    """
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=codec_name",
+        "-of", "csv=p=0",
+        str(filepath),
+    ]
+    try:
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        if result.returncode == 0:
+            codec = result.stdout.decode("utf-8", errors="replace").strip()
+            if codec:
+                return codec
+    except FileNotFoundError:
+        log.debug("  ffprobe not found; cannot check codec")
+    return None
+
+
+def is_flac_compatible(filepath):
+    """
+    Check whether an audio file's codec can be losslessly encoded to FLAC.
+    Returns (compatible: bool, codec: str|None).
+    """
+    codec = probe_audio_codec(filepath)
+    if codec is None:
+        # Can't determine — be conservative, assume incompatible
+        return False, codec
+    return codec in FLAC_COMPATIBLE_CODECS, codec
+
+
 # ── Headered audio conversion (AIFF / WAV) ──────────────────────────────────
 
 def convert_headered_pair(left, right, output, dry_run=False):
@@ -886,6 +936,17 @@ def main(
         display_name = str(rel_dir / base_name) if str(rel_dir) != "." else base_name
         log.info("── [AIFF/WAV pair] %s (%s) ──", display_name, ch_desc)
 
+        # Check FLAC compatibility — probe whichever channel exists
+        probe_file = left if left is not None else right
+        compatible, codec = is_flac_compatible(probe_file)
+        if not compatible:
+            log.warning("  Codec '%s' is not losslessly FLAC-compatible "
+                        "— copying verbatim to preserve data.", codec)
+            for fp in [left, right]:
+                if fp is not None:
+                    _copy_verbatim(fp, rel_dir)
+            continue
+
         dd = _dest_dir(rel_dir)
         if dd is None:
             any_file = left if left is not None else right
@@ -911,6 +972,14 @@ def main(
     for rel_dir, src in headered_solo:
         stem = src.stem
         log.info("── [AIFF/WAV] %s ──", src.name)
+
+        # Check FLAC compatibility
+        compatible, codec = is_flac_compatible(src)
+        if not compatible:
+            log.warning("  Codec '%s' is not losslessly FLAC-compatible "
+                        "— copying verbatim to preserve data.", codec)
+            _copy_verbatim(src, rel_dir)
+            continue
 
         dd = _dest_dir(rel_dir)
         if dd is None:
